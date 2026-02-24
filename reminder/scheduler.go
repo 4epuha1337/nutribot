@@ -1,0 +1,98 @@
+package reminder
+
+import (
+	"fmt"
+	ts "nutribot/timestamp"
+	"nutribot/types"
+	"sync"
+	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+)
+
+type Scheduler struct {
+	bot *tgbotapi.BotAPI
+	users *[]types.User
+	usersMutex *sync.RWMutex
+	offsetManager *ts.OffsetManager
+	stopChan chan struct{}
+}
+
+func NewScheduler(bot *tgbotapi.BotAPI, users *[]types.User, usersMutex *sync.RWMutex, offset *ts.OffsetManager) *Scheduler {
+	return &Scheduler{
+		bot: bot,
+		users: users,
+		usersMutex: usersMutex,
+		offsetManager: offset,
+		stopChan: make(chan struct{}),
+	}
+}
+
+func (s *Scheduler) Start() {
+	ticker := time.NewTicker(1 * time.Minute)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				s.checkReminders()
+			case <-s.stopChan:
+				ticker.Stop()
+				return
+			}
+		}
+	}()
+	fmt.Println("Планировщик напоминаний запущен...")
+}
+
+func (s *Scheduler) Stop() {
+	close(s.stopChan)
+	fmt.Println("Планировщик напоминаний остановлен.")
+}
+
+func (s *Scheduler) checkReminders() {
+	s.usersMutex.RLock()
+	defer s.usersMutex.RUnlock()
+	currentUTC := time.Now().UTC()
+	for _, user := range *s.users {
+		userTime, err := s.getUserTime(user.Id, currentUTC)
+		if err != nil {
+			continue
+		}
+		if s.shouldRemind(user, userTime) {
+			s.sendRemind(user)
+		} 
+	}
+}
+
+func (s *Scheduler) getUserTime(id int, current time.Time) (time.Time, error) {
+	offset, ok := s.offsetManager.GetUserOffset(int64(id))
+	if !ok {
+		return time.Time{}, fmt.Errorf("сдвиг не найден для пользователя %d", id)
+	}
+
+	loc := time.FixedZone("User", offset*3600)
+	return current.In(loc), nil
+}
+
+func (s *Scheduler) shouldRemind(user types.User, uTime time.Time) bool {
+	currentHour := uTime.Hour()
+	currentMinute := uTime.Minute()
+	for _, reminder := range user.Time {
+		if reminder.Hour == currentHour && reminder.Minute == currentMinute {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) sendRemind(user types.User) {
+	if user.State < 0 {
+		return
+	}
+	msg := tgbotapi.NewMessage(int64(user.ChatID), fmt.Sprintf("%s, время принять пищу!", user.Name))
+	_, err := s.bot.Send(msg)
+
+	if err != nil {
+		fmt.Println("Ошибка отправки сообщения пользователю", user.Id, err)
+	}
+}
