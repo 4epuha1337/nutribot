@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
+	"nutribot/types"
 )
 
 func InitDB() (*sql.DB, error) {
@@ -55,4 +56,43 @@ func createTables(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+func CreateUser(db *sql.DB, tgid int, chatid int, name string, age string, offset int, state int) (int64, error) {
+	query := `INSERT INTO users (telegram_id, chat_id, name, age, "offset", state) VALUES (?, ?, ?, ?, ?, ?)`
+	res, err := db.Exec(query, tgid, chatid, name, age, offset, state)
+	if err != nil {
+		return -1, err
+	}
+
+	userID, err := res.LastInsertId()
+	if err != nil {
+    	return 0, err
+	}
+
+	return userID, nil
+}
+
+func GetUserByTelegramId(db *sql.DB, tgid int) (*types.User, int64, error) {
+	query := `SELECT id, chat_id, name, age, "offset", state FROM users WHERE telegram_id = ?`
+	var user types.User
+	var id int64
+	err := db.QueryRow(query, tgid).Scan(
+		&id,
+		&user.ChatID,
+		&user.Name,
+		&user.Age,
+		&user.Offset,
+		&user.State,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, -1, nil
+		}
+		return nil, -1, err
+	}
+
+	user.Id = tgid
+
+	return &user, id, nil
 }
