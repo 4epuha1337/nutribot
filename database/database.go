@@ -2,8 +2,11 @@ package database
 
 import (
 	"database/sql"
-	_ "github.com/mattn/go-sqlite3"
+	"fmt"
+	"log"
 	"nutribot/types"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func InitDB() (*sql.DB, error) {
@@ -95,4 +98,252 @@ func GetUserByTelegramId(db *sql.DB, tgid int) (*types.User, int64, error) {
 	user.Id = tgid
 
 	return &user, id, nil
+}
+
+func GetUserById(db *sql.DB, id int64) (*types.User, error) {
+	query := `SELECT telegram_id, chat_id, name, age, "offset", state FROM users WHERE id = ?`
+	var user types.User
+	err := db.QueryRow(query, id).Scan(
+		&user.Id,
+		&user.ChatID,
+		&user.Name,
+		&user.Age,
+		&user.Offset,
+		&user.State,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &user, nil
+}
+
+func UpdateUserState(db *sql.DB, tgid int, state int) (error) {
+	query := `UPDATE users SET state = ? WHERE telegram_id = ?`
+
+	result, err := db.Exec(query, state, tgid)
+	if err != nil {
+		return fmt.Errorf("ошибка обновления состояния: %v", err)
+	}
+
+	rAff, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rAff == 0 {
+		return fmt.Errorf("пользователь не найден")
+	}
+
+	return nil
+}
+
+func DeleteUser(db *sql.DB, tgid int) (error) {
+	query := `DELETE FROM users WHERE telegram_id = ?`
+	result, err := db.Exec(query, tgid)
+	if err != nil {
+		return fmt.Errorf("ошибка удаления пользователя: %v", err)
+	}
+
+	rAff, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rAff == 0 {
+		return fmt.Errorf("пользователь не найден")
+	}
+
+	return nil
+}
+
+func UpdateUserProfile(db *sql.DB, tgid int, offset int, name string, age int) (error) {
+	query := `UPDATE users SET "offset" = ?, name = ?, age = ? WHERE telegram_id = ?`
+
+	result, err := db.Exec(query, offset, name, age, tgid)
+	if err != nil {
+		return fmt.Errorf("ошибка обновления профиля: %v", err)
+	}
+
+	rAff, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rAff == 0 {
+		return fmt.Errorf("пользователь не найден")
+	}
+
+	return nil
+}
+
+func AddReminders(db *sql.DB, id int, reminders []types.TimeEntry) error {
+	tx, err := db.Begin()
+
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	query := `INSERT INTO reminders (user_id, hour, minute) VALUES (?, ?, ?)`
+	for _, reminder := range reminders {
+		_, err := tx.Exec(query, id, reminder.Hour, reminder.Minute)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func GetRemindersByUserId(db *sql.DB, id int64) ([]types.TimeEntry, error) {
+	query := `SELECT hour, minute FROM reminders WHERE user_id = ? ORDER BY hour, minute`
+	rows, err := db.Query(query, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reminders []types.TimeEntry
+
+	for rows.Next() {
+		var r types.TimeEntry
+		err := rows.Scan(&r.Hour, &r.Minute)
+		if err != nil {
+			return nil, err
+		}
+		reminders = append(reminders, r)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return reminders, nil
+}
+
+func GetFullUserByTelegramId(db *sql.DB, tgid int) (*types.User, error) {
+	user, dbId, err := GetUserByTelegramId(db, tgid)
+	if err != nil {
+		return nil, err
+	}
+
+	reminders, err := GetRemindersByUserId(db, dbId)
+	if err != nil {
+		return nil, err
+	}
+
+	user.Time = reminders
+	return user, nil
+}
+
+func GetFullUserById(db *sql.DB, id int64) (*types.User, error) {
+	user, err := GetUserById(db, id)
+	if err != nil {
+		return nil, err
+	}
+
+	reminders, err := GetRemindersByUserId(db, id)
+	if err != nil {
+		return nil, err
+	}
+
+	user.Time = reminders
+	return user, nil
+}
+
+func DeleteReminderByTimestamp(db *sql.DB, time types.TimeEntry, id int64) error {
+	query := `DELETE FROM reminders WHERE user_id = ? AND hour = ? AND minute = ?`
+	result, err := db.Exec(query, id, time.Hour, time.Minute)
+	if err != nil {
+		return fmt.Errorf("ошибка удаления напоминания: %v", err)
+	}
+
+	rAff, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rAff == 0 {
+		return fmt.Errorf("напоминание не найдено")
+	}
+
+	return nil
+}
+
+func DeleteReminderById(db *sql.DB, id int64) error {
+query := `DELETE FROM reminders WHERE id = ?`
+	result, err := db.Exec(query, id)
+	if err != nil {
+		return fmt.Errorf("ошибка удаления напоминания: %v", err)
+	}
+
+	rAff, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rAff == 0 {
+		return fmt.Errorf("напоминание не найдено")
+	}
+
+	return nil
+}
+
+func DeleteAllReminders(db *sql.DB, id int64) error {
+	query := `DELETE FROM reminders WHERE user_id = ?`
+	_, err := db.Exec(query, id)
+	if err != nil {
+		return fmt.Errorf("ошибка удаления напоминания: %v", err)
+	}
+
+	return nil
+}
+
+func CountUserReminders(db *sql.DB, id int64) (int, error) {
+	query := `SELECT COUNT(*) FROM reminders WHERE user_id = ?`
+	
+	var count int
+	err := db.QueryRow(query, id).Scan(&count)
+	if err != nil {
+		return -1, err
+	}
+
+	return count, nil
+}
+
+func GetReminderById(db *sql.DB, id int) (int64, *types.TimeEntry, error) {
+	query := `SELECT user_id, hour, minute FROM reminders WHERE id = ?`
+	var time types.TimeEntry
+	var tgId int64
+	err := db.QueryRow(query, id).Scan(
+		&tgId,
+		&time.Hour,
+		&time.Minute,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return -1, nil, nil
+		}
+		return -1, nil, err
+	}
+
+	return tgId, &time, nil
+}
+
+func UserExists(db *sql.DB, tgid int) bool {
+	query := `SELECT COUNT(*) FROM users WHERE telegram_id = ?`
+
+	var count int
+	err := db.QueryRow(query, tgid).Scan(&count)
+	if err != nil {
+		log.Printf("Ошибка проверки существования пользователя: %v", err)
+		return false
+	}
+
+	return count > 0
 }
