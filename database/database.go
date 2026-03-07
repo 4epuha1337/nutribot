@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"nutribot/types"
+	ts "nutribot/timestamp"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -61,7 +62,41 @@ func createTables(db *sql.DB) error {
 	return nil
 }
 
-func CreateUser(db *sql.DB, tgid int, chatid int, name string, age string, offset int, state int) (int64, error) {
+func LoadOffsets(db *sql.DB, offsetManager *ts.OffsetManager) error {
+    query := `SELECT telegram_id, "offset" FROM users`
+    
+    rows, err := db.Query(query)
+    if err != nil {
+        return fmt.Errorf("ошибка загрузки offset: %v", err)
+    }
+    defer rows.Close()
+    
+    loadedCount := 0
+    for rows.Next() {
+        var tgid int64
+        var offset int
+        
+        if err := rows.Scan(&tgid, &offset); err != nil {
+            log.Printf("Ошибка сканирования offset: %v", err)
+            continue
+        }
+        
+        if err := offsetManager.SetUserOffset(tgid, offset); err != nil {
+            log.Printf("Ошибка установки offset для пользователя %d: %v", tgid, err)
+        } else {
+            loadedCount++
+        }
+    }
+    
+    if err = rows.Err(); err != nil {
+        return fmt.Errorf("ошибка при итерации по строкам: %v", err)
+    }
+    
+    log.Printf("Загружено %d смещений часовых поясов", loadedCount)
+    return nil
+}
+
+func CreateUser(db *sql.DB, tgid int, chatid int, name string, age int, offset int, state int) (int64, error) {
 	query := `INSERT INTO users (telegram_id, chat_id, name, age, "offset", state) VALUES (?, ?, ?, ?, ?, ?)`
 	res, err := db.Exec(query, tgid, chatid, name, age, offset, state)
 	if err != nil {
@@ -346,4 +381,24 @@ func UserExists(db *sql.DB, tgid int) bool {
 	}
 
 	return count > 0
+}
+
+func GetRemindersWithID(db *sql.DB, userID int64) ([]types.ReminderWithID, error) {
+	query := `SELECT id, hour, minute FROM reminders WHERE user_id = ? ORDER BY hour, minute`
+    rows, err := db.Query(query, userID)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var reminders []types.ReminderWithID
+    for rows.Next() {
+        var r types.ReminderWithID
+        err := rows.Scan(&r.ID, &r.Reminder.Hour, &r.Reminder.Minute)
+        if err != nil {
+            return nil, err
+        }
+        reminders = append(reminders, r)
+    }
+    return reminders, rows.Err()
 }
