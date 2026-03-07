@@ -6,6 +6,7 @@ import (
 	ts "nutribot/timestamp"
 	"nutribot/types"
 	"time"
+	"nutribot/database"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -48,93 +49,29 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) checkReminders() {
-	currentUTC := time.Now().UTC()
-
-	users, err := s.getAllUsersWithReminders()
-	if err != nil {
-		fmt.Printf("Ошибка получения пользователей из БД: %v\n", err)
-		return
-	}
-	
-	for _, user := range users {
-		if user.State < 0 {
-			continue
-		}
-		
-		userTime, err := s.getUserTime(user.Id, currentUTC)
-		if err != nil {
-			fmt.Printf("Ошибка получения времени для пользователя %d: %v\n", user.Id, err)
-			continue
-		}
-		
-		if s.shouldRemind(user, userTime) {
-			s.sendRemind(user)
-		}
-	}
-}
-
-func (s *Scheduler) getAllUsersWithReminders() ([]types.User, error) {
-	rows, err := s.db.Query(`
-		SELECT id, telegram_id, chat_id, name, age, "offset", state 
-		FROM users
-	`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var users []types.User
-	for rows.Next() {
-		var user types.User
-		var dbID int64
-		err := rows.Scan(
-			&dbID,
-			&user.Id,
-			&user.ChatID,
-			&user.Name,
-			&user.Age,
-			&user.Offset,
-			&user.State,
-		)
-		if err != nil {
-			return nil, err
-		}
-
-		reminders, err := s.getRemindersByUserID(dbID)
-		if err != nil {
-			fmt.Printf("Ошибка получения напоминаний для пользователя %d: %v\n", user.Id, err)
-			continue
-		}
-		user.Time = reminders
-		
-		users = append(users, user)
-	}
-	
-	return users, rows.Err()
-}
-
-func (s *Scheduler) getRemindersByUserID(dbID int64) ([]types.TimeEntry, error) {
-	rows, err := s.db.Query(`
-		SELECT hour, minute FROM reminders 
-		WHERE user_id = ? 
-		ORDER BY hour, minute
-	`, dbID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var reminders []types.TimeEntry
-	for rows.Next() {
-		var r types.TimeEntry
-		err := rows.Scan(&r.Hour, &r.Minute)
-		if err != nil {
-			return nil, err
-		}
-		reminders = append(reminders, r)
-	}
-	
-	return reminders, rows.Err()
+    currentUTC := time.Now().UTC()
+    
+    users, err := database.GetAllUsersWithReminders(s.db)
+    if err != nil {
+        fmt.Printf("Ошибка получения пользователей из БД: %v\n", err)
+        return
+    }
+    
+    for _, user := range users {
+        if user.State < 0 {
+            continue
+        }
+        
+        userTime, err := s.getUserTime(user.Id, currentUTC)
+        if err != nil {
+            fmt.Printf("Ошибка получения времени для пользователя %d: %v\n", user.Id, err)
+            continue
+        }
+        
+        if s.shouldRemind(user, userTime) {
+            s.sendRemind(user)
+        }
+    }
 }
 
 func (s *Scheduler) getUserTime(id int, current time.Time) (time.Time, error) {
