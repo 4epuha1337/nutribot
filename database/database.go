@@ -404,45 +404,64 @@ func GetRemindersWithID(db *sql.DB, userID int64) ([]types.ReminderWithID, error
 }
 
 func GetAllUsersWithReminders(db *sql.DB) ([]types.User, error) {
-    query := `SELECT id, telegram_id, chat_id, name, age, "offset", state FROM users`
-    
+    query := `
+        SELECT 
+            u.telegram_id, u.chat_id, u.name, u.age, u."offset", u.state,
+            r.hour, r.minute
+        FROM users u
+        LEFT JOIN reminders r ON u.id = r.user_id
+        ORDER BY u.telegram_id
+    `
+
     rows, err := db.Query(query)
     if err != nil {
-        return nil, fmt.Errorf("ошибка получения пользователей: %v", err)
+        return nil, fmt.Errorf("ошибка JOIN запроса: %v", err)
     }
     defer rows.Close()
 
-    var users []types.User
+    usersMap := make(map[int]*types.User)
+    var sortedIDs []int
+
     for rows.Next() {
-        var user types.User
-        var dbID int64
-        err := rows.Scan(
-            &dbID,
-            &user.Id,
-            &user.ChatID,
-            &user.Name,
-            &user.Age,
-            &user.Offset,
-            &user.State,
-        )
+        var tgid int
+        var chatID int
+        var name string
+        var age int
+        var offset int
+        var state int
+        var hour, minute sql.NullInt64
+
+        err := rows.Scan(&tgid, &chatID, &name, &age, &offset, &state, &hour, &minute)
         if err != nil {
-            return nil, fmt.Errorf("ошибка сканирования пользователя: %v", err)
+            return nil, fmt.Errorf("ошибка сканирования: %v", err)
         }
 
-        reminders, err := GetRemindersByUserId(db, dbID)
-        if err != nil {
-            fmt.Printf("Ошибка получения напоминаний для пользователя %d: %v\n", user.Id, err)
-            user.Time = []types.TimeEntry{}
-        } else {
-            user.Time = reminders
+        if _, ok := usersMap[tgid]; !ok {
+            user := &types.User{
+                Id:     tgid,
+                ChatID: chatID,
+                Name:   name,
+                Age:    age,
+                Offset: offset,
+                State:  state,
+                Time:   []types.TimeEntry{},
+            }
+            usersMap[tgid] = user
+            sortedIDs = append(sortedIDs, tgid)
         }
-        
-        users = append(users, user)
+
+        if hour.Valid && minute.Valid {
+            usersMap[tgid].Time = append(usersMap[tgid].Time, types.TimeEntry{
+                Hour:   int(hour.Int64),
+                Minute: int(minute.Int64),
+            })
+        }
     }
-    
-    if err = rows.Err(); err != nil {
-        return nil, fmt.Errorf("ошибка при итерации по пользователям: %v", err)
+
+    var result []types.User
+    for _, id := range sortedIDs {
+        result = append(result, *usersMap[id])
     }
-    
-    return users, nil
+
+    return result, nil
 }
