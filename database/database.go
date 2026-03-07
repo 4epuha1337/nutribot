@@ -402,3 +402,47 @@ func GetRemindersWithID(db *sql.DB, userID int64) ([]types.ReminderWithID, error
     }
     return reminders, rows.Err()
 }
+
+func GetAllUsersWithReminders(db *sql.DB) ([]types.User, error) {
+    query := `SELECT id, telegram_id, chat_id, name, age, "offset", state FROM users`
+    
+    rows, err := db.Query(query)
+    if err != nil {
+        return nil, fmt.Errorf("ошибка получения пользователей: %v", err)
+    }
+    defer rows.Close()
+
+    var users []types.User
+    for rows.Next() {
+        var user types.User
+        var dbID int64
+        err := rows.Scan(
+            &dbID,
+            &user.Id,
+            &user.ChatID,
+            &user.Name,
+            &user.Age,
+            &user.Offset,
+            &user.State,
+        )
+        if err != nil {
+            return nil, fmt.Errorf("ошибка сканирования пользователя: %v", err)
+        }
+
+        reminders, err := GetRemindersByUserId(db, dbID)
+        if err != nil {
+            fmt.Printf("Ошибка получения напоминаний для пользователя %d: %v\n", user.Id, err)
+            user.Time = []types.TimeEntry{}
+        } else {
+            user.Time = reminders
+        }
+        
+        users = append(users, user)
+    }
+    
+    if err = rows.Err(); err != nil {
+        return nil, fmt.Errorf("ошибка при итерации по пользователям: %v", err)
+    }
+    
+    return users, nil
+}
