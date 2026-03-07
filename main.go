@@ -1,18 +1,16 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	rd "nutribot/reminder"
 	ts "nutribot/timestamp"
+    "database/sql"
+    "nutribot/database"
 	"nutribot/types"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 	"unicode"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -20,59 +18,10 @@ import (
 )
 
 var  (
-    Users []types.User
+    db *sql.DB
     OffsetManager *ts.OffsetManager
-    UsersMutex sync.RWMutex
     ReminderScheduler *rd.Scheduler
 )
-func InitUsers () error{
-    OffsetManager = ts.NewOffsetManager()
-    data, err := os.ReadFile("users.json")
-    if err == nil {
-        err = json.Unmarshal(data, &Users)
-        if err == nil {
-            fmt.Println("Список пользователей успешно загружен")
-            loadedCount := 0
-            for _, user := range Users {
-                err := OffsetManager.SetUserOffset(int64(user.Id), user.Offset)
-                if err != nil {
-                    fmt.Printf("Ошибка при установке offset %d для пользователя %d: %v\n", 
-                        user.Offset, user.Id, err)
-                } else {
-                    loadedCount++
-                }
-            }
-            
-            fmt.Printf("Загружено %d пользователей. Offset установлен для %d из них\n", 
-                len(Users), loadedCount)
-            return nil
-        }
-    }
-
-    fmt.Println("Файл не найден. Создаю новый...")
-    file, err := os.Create("users.json")
-    if err != nil {
-        fmt.Println("Ошибка при содании файла: ", err)
-        return err
-    }
-    var nullFile []byte
-    nullFile = append(nullFile, '[', ']')
-    _, err = file.Write(nullFile)
-    if err != nil {
-        fmt.Println("Ошибка при инициировании нового файла: ", err)
-        return err
-    }
-    return nil
-}
-
-func UserExist(id int) (int, bool) {
-    for i, u := range Users {
-        if id == u.Id {
-            return i, true
-        } 
-    }
-    return -1, false
-}
 
 func hasWhitespace(s string) bool {
     return strings.ContainsFunc(s, unicode.IsSpace)
@@ -161,47 +110,6 @@ func MinutesToTimeEntry(minutes int) types.TimeEntry {
     }
 }
 
-func SaveUsers() error {
-    if _, err := os.Stat("users.json"); err == nil {
-        backupName := fmt.Sprintf("users_backup_%s.json", 
-            time.Now().Format("2006-01-02_15-04-05"))
-        
-        input, err := os.ReadFile("users.json")
-        if err == nil {
-            os.WriteFile(backupName, input, 0644)
-            cleanupOldBackups()
-        }
-    }
-
-    data, err := json.MarshalIndent(Users, "", "  ")
-    if err != nil {
-        log.Printf("Ошибка при маршалинге пользователей: %v", err)
-        return fmt.Errorf("ошибка преобразования данных: %v", err)
-    }
-
-    err = os.WriteFile("users.json", data, 0644)
-    if err != nil {
-        log.Printf("Ошибка при записи в файл users.json: %v", err)
-        return fmt.Errorf("не удалось записать файл: %v", err)
-    }
-
-    log.Printf("Пользователи успешно сохранены. Всего: %d", len(Users))
-    return nil
-}
-
-func cleanupOldBackups() {
-    files, err := filepath.Glob("users_backup_*.json")
-    if err != nil {
-        return
-    }
-
-    if len(files) > 5 {
-        for i := 0; i < len(files)-5; i++ {
-            os.Remove(files[i])
-        }
-    }
-}
-
 func showMainMenu(u types.User) tgbotapi.ReplyKeyboardMarkup{
     keyboard := tgbotapi.NewReplyKeyboard(
         tgbotapi.NewKeyboardButtonRow(
@@ -279,11 +187,13 @@ func handleCallback(callback *tgbotapi.CallbackQuery, bot *tgbotapi.BotAPI) {
 
     fmt.Printf("Callback получен: data=%s, userID=%d\n", data, userID)
 
-    UsersMutex.Lock()
-    defer UsersMutex.Unlock()
 
-    i, flag := UserExist(int(userID))
-    if !flag {
+    user, dbID, err := database.GetUserByTelegramId(db, int(userID))
+    if err != nil {
+        log.Printf("Ошибка получения пользователя: %v", err)
+    }
+    
+    if user == nil {
         bot.Send(tgbotapi.NewMessage(chatID, "Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
         return
     }
@@ -294,7 +204,11 @@ func handleCallback(callback *tgbotapi.CallbackQuery, bot *tgbotapi.BotAPI) {
         msg.ReplyMarkup = showNotificationsMenu()
         bot.Send(msg)
 
-        Users[i].State = 0
+        err = database.UpdateUserState(db, user.Id, 0)
+        if err != nil {
+            log.Printf("Ошибка изменения состояния: %v", err)
+            return 
+        }
 
         delMsg := tgbotapi.NewDeleteMessage(chatID, messageID)
         bot.Request(delMsg)
@@ -304,21 +218,44 @@ func handleCallback(callback *tgbotapi.CallbackQuery, bot *tgbotapi.BotAPI) {
         if err != nil {
             return
         }
-        if index < 1 || index > len(Users[i].Time) {
+        reminders, err := database.GetRemindersWithID(db, dbID)
+        if err != nil {
+            log.Printf("ошибка получения напоминаний: %v", err)
+            msg := tgbotapi.NewMessage(chatID, "Ошибка получения списка напоминаний.")
+            bot.Send(msg)
+            return
+        }
+        if index < 1 || index > len(reminders) {
             msg = tgbotapi.NewMessage(chatID, fmt.Sprintf(`Данного напоминания не существует, проверьте еще раз.`))
             bot.Send(msg)
             return
         }
-        times := Users[i].Time[index-1]
-        Users[i].Time = append(Users[i].Time[:index-1], Users[i].Time[index:]...)
-        Users[i].State = 0
-        if err = SaveUsers(); err != nil {
-            fmt.Printf("Ошибка сохранения пользователя: %v", err)
+
+        reminderToDelete := reminders[index-1]
+        err = database.DeleteReminderById(db, reminderToDelete.ID)
+        if err != nil {
+            log.Printf("Ошибка удаления напоминания: %v", err)
+            msg := tgbotapi.NewMessage(chatID, "Ошибка при удалении напоминания.")
+            bot.Send(msg)
             return
         }
-        text := fmt.Sprintf(`Уведомление на %d:%d успешно удалено.`, times.Hour, times.Minute)
-        if len(Users[i].Time) > 0 {
-            text = addAllTimeToText(Users[i], text)
+        err = database.UpdateUserState(db, user.Id, 0)
+        if err != nil {
+            log.Printf("Ошибка изменения состояния: %v", err)
+        }
+
+        newReminders, err := database.GetRemindersByUserId(db, dbID)
+        if err != nil {
+            log.Printf("Ошибка получения обновленных напоминаний: %v", err)
+        }
+
+        text := fmt.Sprintf(`Уведомление на %d:%d успешно удалено.`, reminderToDelete.Reminder.Hour, reminderToDelete.Reminder.Minute)
+        if len(newReminders) > 0 {
+            tempUser := types.User {
+                Id: user.Id,
+                Time: newReminders,
+            }
+            text = addAllTimeToText(tempUser, text)
         } else {
             text = text + " У вас нет установленных уведомлений"
         }
@@ -333,11 +270,20 @@ func handleCallback(callback *tgbotapi.CallbackQuery, bot *tgbotapi.BotAPI) {
 
 func main() {
     _ = godotenv.Load()
-    err := InitUsers()
+    db, err := database.InitDB()
     if err != nil {
         fmt.Println("Ошибка: ", err)
         return
     }
+    defer db.Close()
+    log.Println("База данных инициализирована")
+
+    OffsetManager = ts.NewOffsetManager()
+
+    if err := database.LoadOffsets(db, OffsetManager); err != nil {
+        log.Printf("Предупреждение: не удалось загрузить offset: %v", err)
+    }
+
     token := os.Getenv("BOT_TOKEN")
     bot, err := tgbotapi.NewBotAPI(token)
     if err != nil {
@@ -346,8 +292,7 @@ func main() {
 
     ReminderScheduler = rd.NewScheduler(
         bot,
-        &Users,
-        &UsersMutex,
+        db,
         OffsetManager,
     )
 
@@ -366,397 +311,574 @@ func main() {
         if update.Message != nil {
             log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
 
-            UsersMutex.Lock()
             
             var msg tgbotapi.MessageConfig
+            tgID := int(update.Message.From.ID)
 
             if update.Message.IsCommand() {
                 switch update.Message.Command() {
                 case "start":
-                    if i, flag := UserExist(int(update.Message.From.ID)); flag {
-                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, %s! Чтобы посмотреть свои уведомления, напиши /list. Для добавления нового уведомления напиши /reminder, для удаления - /delete. Для отмены отправки уведомлений напиши /cancel", Users[i].Name))
-                        msg.ReplyMarkup = showMainMenu(Users[i])
+                    user, _, err := database.GetUserByTelegramId(db, tgID)
+                    if err != nil {
+                        log.Printf("Ошибка получения пользователя: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка. Попробуйте позже")
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
-                    var newUser types.User
-                    newUser.Id = int(update.Message.From.ID)
-                    newUser.ChatID = int(update.Message.Chat.ID)
-                    newUser.State = 1
+                    if user != nil {
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, %s! Чтобы посмотреть свои уведомления, напиши /list. Для добавления нового уведомления напиши /reminder, для удаления - /delete. Для отмены отправки уведомлений напиши /cancel", user.Name))
+                        msg.ReplyMarkup = showMainMenu(*user)
+                        bot.Send(msg)
+                        continue
+                    }
+                    _, err = database.CreateUser(db, tgID, int(update.Message.Chat.ID), "", 0, 0, 1)
+                    if err != nil {
+                        log.Printf("Ошибка создания пользователя: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка при регистрации. Попробуйте позже.")
+                        bot.Send(msg)
+                        continue
+                    }
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, `Привет! Давай познакомимся. Меня зовут Морковка, я буду твоим <ВСТАВИТЬ ТЕКСТ>.
 Для начала, давай познакомимся. Как тебя зовут?`)
-                    Users = append(Users, newUser)
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 case "reminder":
-                    i, flag := UserExist(int(update.Message.From.ID))
-                    if !flag {
-                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
+                    user, dbID, err := database.GetUserByTelegramId(db, tgID)
+                    if err != nil {
+                        log.Printf("Ошибка получения пользователя: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
-                    if len(Users[i].Time) > 10 {
+                    if user == nil {
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Привет, для начала нужно зарегистрироваться. Для этого напиши /start")
+                        bot.Send(msg)
+                        continue
+                    }
+
+                    count, err := database.CountUserReminders(db, dbID)
+                    if err != nil {
+                        log.Printf("Ошибка подсчета напоминаний: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
+                        bot.Send(msg)
+                        continue
+                    }
+
+                    if count >= 10 {
                         msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("У тебя уже есть 10 уведомлений."))
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Для добавления нового уведомления, напиши время нового уведомления в формате hh:mm. Для отмены, напиши cancel"))
                     msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(false)
                     bot.Send(msg)
-                    Users[i].State = 5
-                    UsersMutex.Unlock()
+                    database.UpdateUserState(db, user.Id, 5)
                     continue
                 case "delete":
-                    i, flag := UserExist(int(update.Message.From.ID))
-                    if !flag {
-                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
+                    user, dbID, err := database.GetUserByTelegramId(db, tgID)
+                    if err != nil {
+                        log.Printf("Ошибка получения пользователя: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
-                    if len(Users[i].Time) == 0 {
+                    if user == nil {
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
+                        bot.Send(msg)
+                        continue
+                    }
+                    reminders, err := database.GetRemindersByUserId(db, dbID)
+                    if err != nil {
+                        log.Printf("Ошибка получения напоминаний: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
+                        bot.Send(msg)
+                        continue
+                    }
+                    if len(reminders) == 0 {
                         msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("У тебя уже нет уведомлений."))
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
                     text := fmt.Sprintf(`Для удаления уведомления, напиши номер удаляемого уведомления, либо нажми на кнопку. Установленные уведомления:`)
-                    for j, time := range Users[i].Time {
+                    for j, time := range reminders {
                         text = fmt.Sprintf("%s\n%d - %d:%d", text, j+1, time.Hour, time.Minute)
                     }
                     text = text + "\nДля отмены, напиши cancel"
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
-                    msg.ReplyMarkup = showDeleteMenu(Users[i])
+                    msg.ReplyMarkup = showDeleteMenu(types.User{Id: user.Id, Time: reminders})
                     bot.Send(msg)
-                    Users[i].State = 6
-                    UsersMutex.Unlock()
+                    database.UpdateUserState(db, user.Id, 6)
                     continue
                 case "cancel":
-                    i, flag := UserExist(int(update.Message.From.ID))
-                    if !flag {
-                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
+                    user, _, err := database.GetUserByTelegramId(db, tgID)
+                    if err != nil {
+                        log.Printf("Ошибка получения пользователя: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
-                    if Users[i].State == -1 {
-                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений снова включена!"))
-                        msg.ReplyMarkup = showMainMenu(Users[i])
+                    if user == nil {
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Привет, для начала нужно зарегистрироваться. Для этого напиши /start")
                         bot.Send(msg)
-                        Users[i].State = 0
-                        if err = SaveUsers(); err != nil {
-                            fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                            UsersMutex.Unlock()
-                            continue
-                        }
-                        UsersMutex.Unlock()
                         continue
+                    }
+                    if user.State == -1 {
+                        err = database.UpdateUserState(db, user.Id, 0)
+                        if err != nil {
+                            log.Printf("Ошибка обновления состояния: %v", err)
+                        }
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений снова включена!"))
+                        msg.ReplyMarkup = showMainMenu(*user)
+                        bot.Send(msg)
+                        continue
+                    }
+                    err = database.UpdateUserState(db, user.Id, -1)
+                    if err != nil {
+                        log.Printf("Ошибка обновления состояния: %v", err)
                     }
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений отключена."))
-                    msg.ReplyMarkup = showMainMenu(Users[i])
+                    msg.ReplyMarkup = showMainMenu(*user)
                     bot.Send(msg)
-                    Users[i].State = -1
-                    if err = SaveUsers(); err != nil {
-                        fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                        UsersMutex.Unlock()
-                        continue
-                    }
-                    UsersMutex.Unlock()
                     continue
                 case "list":
-                    i, flag := UserExist(int(update.Message.From.ID))
-                    if !flag {
-                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
+                    user, dbID, err := database.GetUserByTelegramId(db, tgID)
+                    if err != nil {
+                        log.Printf("Ошибка получения пользователя: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
-                    if len(Users[i].Time) == 0 {
+                    if user == nil {
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, для начала нужно зарегистрироваться. Для этого напиши /start"))
+                        bot.Send(msg)
+                        continue
+                    }
+                    reminders, err := database.GetRemindersByUserId(db, dbID)
+                    if err != nil {
+                        log.Printf("Ошибка получения напоминаний: %v", err)
+                        msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
+                        bot.Send(msg)
+                        continue
+                    }
+                    if len(reminders) == 0 {
                         msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("У вас нет установленных уведомлений."))
                         bot.Send(msg)
-                        UsersMutex.Unlock()
                         continue
                     }
                     text := fmt.Sprintf(`Установленные уведомления:`)
-                    for j, time := range Users[i].Time {
+                    for j, time := range reminders {
                         text = fmt.Sprintf("%s\n%d - %d:%d", text, j+1, time.Hour, time.Minute)
                     }
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
                     msg.ReplyMarkup = showNotificationsMenu()
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 default:
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Извини, не знаю такой команды")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
             }
 
-            i, flag := UserExist(int(update.Message.From.ID))
-            if !flag {
+            user, dbID, err := database.GetUserByTelegramId(db, tgID)
+            if err != nil {
+                log.Printf("Ошибка получения пользователя: %v", err)
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка. Попробуйте позже.")
+                bot.Send(msg)
+                continue
+            }
+            if user == nil {
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Привет! Для того, чтобы пользоваться мной, необходимо зарегистрироваться. напиши /start")
                 bot.Send(msg)
-                UsersMutex.Unlock()
                 continue
             }
 
-            switch Users[i].State {
+            switch user.State {
             case 1:
                 if hasWhitespace(update.Message.Text) {
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Напиши только имя")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                Users[i].Name = update.Message.Text
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Приятно познакомится, %s! А сколько тебе лет?", Users[i].Name))
+    
+                err = database.UpdateUserProfile(db, user.Id, user.Offset, update.Message.Text, user.Age)
+                if err != nil {
+                    log.Printf("Ошибка обновления имени: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка сохранения. Попробуйте позже.")
+                    bot.Send(msg)
+                    continue
+                }
+    
+                err = database.UpdateUserState(db, user.Id, 2)
+                if err != nil {
+                    log.Printf("Ошибка обновления состояния: %v", err)
+                }
+    
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Приятно познакомиться, %s! А сколько тебе лет?", update.Message.Text))
                 bot.Send(msg)
-                Users[i].State = 2
-                UsersMutex.Unlock()
                 continue
+
             case 2:
                 age, err := strconv.Atoi(update.Message.Text)
-                if err != nil {
-                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Это не похоже на возраст, попробуй еще раз!")
+                if err != nil || age < 1 || age > 150 {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Пожалуйста, введите корректный возраст (число от 1 до 150)")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                Users[i].Age = age
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Для корректной работы также нужно узнать ваш часовой пояс. Введите только сдвиг относительно UTC0 (Для Москвы, Санкт-Петербурга - 3)"))
+
+                err = database.UpdateUserProfile(db, user.Id, user.Offset, user.Name, age)
+                if err != nil {
+                    log.Printf("Ошибка обновления возраста: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка сохранения. Попробуйте позже.")
+                    bot.Send(msg)
+                    continue
+                }
+    
+                err = database.UpdateUserState(db, user.Id, 3)
+                if err != nil {
+                    log.Printf("Ошибка обновления состояния: %v", err)
+                }
+    
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Для корректной работы также нужно узнать ваш часовой пояс. Введите только сдвиг относительно UTC0 (Для Москвы, Санкт-Петербурга - 3)")
                 bot.Send(msg)
-                Users[i].State = 3
-                UsersMutex.Unlock()
                 continue
+
             case 3:
                 offset, err := strconv.Atoi(update.Message.Text)
                 if err != nil {
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Это не похоже на сдвиг, попробуй еще раз!")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
                 if offset > 14 || offset < -12 {
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Это неверный сдвиг, он должен быть в промежутке от -12 до 14, попробуй еще раз!")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                Users[i].Offset = offset
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Когда тебе напоминать о приеме пищи? Напиши время в формате hh:mm, несколько раз через запятую, но не более 10"))
+    
+                err = database.UpdateUserProfile(db, user.Id, offset, user.Name, user.Age)
+                if err != nil {
+                    log.Printf("Ошибка обновления offset: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка сохранения. Попробуйте позже.")
+                    bot.Send(msg)
+                    continue
+                }
+
+                err = database.UpdateUserState(db, user.Id, 4)
+                if err != nil {
+                    log.Printf("Ошибка обновления состояния: %v", err)
+                }
+
+                OffsetManager.SetUserOffset(int64(user.Id), offset)
+    
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Когда тебе напоминать о приеме пищи? Напиши время в формате hh:mm, несколько раз через запятую, но не более 10")
                 bot.Send(msg)
-                Users[i].State = 4
-                UsersMutex.Unlock()
                 continue
+
             case 4:
+                if update.Message.Text == "cancel" {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Регистрация отменена.")
+                    msg.ReplyMarkup = showMainMenu(*user)
+                    bot.Send(msg)
+                    database.UpdateUserState(db, user.Id, 0)
+                    continue
+                }
+    
                 times, err := ParseTimeString(update.Message.Text)
                 if err != nil {
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf(`Пожалуйста, укажите время в формате hh:mm, hh:mm
 Например: 19:20, 15:40`))
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                Users[i].Time = times
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отлично! Я все запомнил, и теперь буду напоминать тебе о необходимости приема пищи!"))
-                msg.ReplyMarkup = showMainMenu(Users[i])
-                bot.Send(msg)
-                Users[i].State = 0
-                err = OffsetManager.SetUserOffset(int64(Users[i].ChatID), Users[i].Offset)
+    
+                err = database.AddReminders(db, int(dbID), times)
                 if err != nil {
-                    fmt.Printf("Ошибка установки offset: %v\n", err)
-                }
-                if err = SaveUsers(); err != nil {
-                    fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                    UsersMutex.Unlock()
+                    log.Printf("Ошибка сохранения напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка сохранения. Попробуйте позже.")
+                    bot.Send(msg)
                     continue
                 }
-                UsersMutex.Unlock()
+    
+                err = database.UpdateUserState(db, user.Id, 0)
+                if err != nil {
+                    log.Printf("Ошибка обновления состояния: %v", err)
+                }
+    
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Отлично! Я все запомнил, и теперь буду напоминать тебе о необходимости приема пищи!")
+                msg.ReplyMarkup = showMainMenu(*user)
+                bot.Send(msg)
                 continue
+
             case 5:
                 if update.Message.Text == "cancel" {
-                    text := fmt.Sprintf("Добавление нового напоминания отменено.")
-                    if len(Users[i].Time) > 0 {
-                        text = addAllTimeToText(Users[i], text)
+                    text := "Добавление нового напоминания отменено."
+        
+                    reminders, err := database.GetRemindersByUserId(db, dbID)
+                    if err == nil && len(reminders) > 0 {
+                    tempUser := types.User{Id: user.Id, Time: reminders}
+                        text = addAllTimeToText(tempUser, text)
                     } else {
                         text = text + " У вас нет установленных уведомлений"
                     }
+        
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
                     msg.ReplyMarkup = showNotificationsMenu()
                     bot.Send(msg)
-                    Users[i].State = 0
-                    UsersMutex.Unlock()
+                    database.UpdateUserState(db, user.Id, 0)
                     continue
                 }
+    
+                count, err := database.CountUserReminders(db, dbID)
+                if err != nil {
+                    log.Printf("Ошибка подсчета напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка проверки лимита.")
+                    bot.Send(msg)
+                    continue
+                }
+                if count >= 10 {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "У тебя уже есть 10 уведомлений.")
+                    bot.Send(msg)
+                    database.UpdateUserState(db, user.Id, 0)
+                    continue
+                }
+    
                 times, err := ParseTimeString(update.Message.Text)
                 if err != nil {
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf(`Пожалуйста, укажите время в формате hh:mm, hh:mm
 Например: 19:20, 15:40`))
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                Users[i].Time = append(Users[i].Time, times...)
-                Users[i].State = 0
-                if err = SaveUsers(); err != nil {
-                    fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                    UsersMutex.Unlock()
+
+                err = database.AddReminders(db, int(dbID), times)
+                if err != nil {
+                    log.Printf("Ошибка сохранения напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка сохранения.")
+                    bot.Send(msg)
                     continue
                 }
-                text := fmt.Sprintf("Новое уведомление на %d:%d успешно установлено.", times[0].Hour, times[0].Minute)
-                if len(Users[i].Time) > 0 {
-                    text = addAllTimeToText(Users[i], text)
-                } else {
-                    text = text + " У вас нет установленных уведомлений"
+
+                database.UpdateUserState(db, user.Id, 0)
+
+                reminders, _ := database.GetRemindersByUserId(db, dbID)
+    
+                text := fmt.Sprintf("Новое уведомление на %02d:%02d успешно установлено.", times[0].Hour, times[0].Minute)
+                if len(reminders) > 0 {
+                    tempUser := types.User{Id: user.Id, Time: reminders}
+                    text = addAllTimeToText(tempUser, text)
                 }
+    
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
                 msg.ReplyMarkup = showNotificationsMenu()
                 bot.Send(msg)
-                UsersMutex.Unlock()
                 continue
+
             case 6:
                 if update.Message.Text == "cancel" {
-                    text := fmt.Sprintf("Удаление напоминания отменено.")
-                    if len(Users[i].Time) > 0 {
-                        text = addAllTimeToText(Users[i], text)
+                    text := "Удаление напоминания отменено."
+        
+                    reminders, err := database.GetRemindersByUserId(db, dbID)
+                    if err == nil && len(reminders) > 0 {
+                        tempUser := types.User{Id: user.Id, Time: reminders}
+                        text = addAllTimeToText(tempUser, text)
                     } else {
                         text = text + " У вас нет установленных уведомлений"
                     }
+        
                     msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
                     msg.ReplyMarkup = showNotificationsMenu()
                     bot.Send(msg)
-                    Users[i].State = 0
-                    UsersMutex.Unlock()
+                    database.UpdateUserState(db, user.Id, 0)
                     continue
                 }
+    
                 index, err := strconv.Atoi(update.Message.Text)
                 if err != nil {
-                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf(`Пожалуйста, введите только номер напоминания.`))
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Пожалуйста, введите только номер напоминания.")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                if index < 1 || index > len(Users[i].Time) {
-                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf(`Данного напоминания не существует, проверьте еще раз.`))
+
+                remindersWithID, err := database.GetRemindersWithID(db, dbID)
+                if err != nil {
+                    log.Printf("Ошибка получения напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка получения списка.")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                times := Users[i].Time[index-1]
-                Users[i].Time = append(Users[i].Time[:index-1], Users[i].Time[index:]...)
-                Users[i].State = 0
-                if err = SaveUsers(); err != nil {
-                    fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                    UsersMutex.Unlock()
+    
+                if index < 1 || index > len(remindersWithID) {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Данного напоминания не существует, проверьте еще раз.")
+                    bot.Send(msg)
                     continue
                 }
-                text := fmt.Sprintf(`Уведомление на %d:%d успешно удалено.`, times.Hour, times.Minute)
-                if len(Users[i].Time) > 0 {
-                    text = addAllTimeToText(Users[i], text)
+
+                reminderToDelete := remindersWithID[index-1]
+                err = database.DeleteReminderById(db, reminderToDelete.ID)
+                if err != nil {
+                    log.Printf("Ошибка удаления напоминания: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка удаления.")
+                    bot.Send(msg)
+                    continue
+                }
+
+                database.UpdateUserState(db, user.Id, 0)
+
+                reminders, _ := database.GetRemindersByUserId(db, dbID)
+    
+                text := fmt.Sprintf(" Уведомление на %02d:%02d успешно удалено.", 
+                    reminderToDelete.Reminder.Hour, reminderToDelete.Reminder.Minute)
+    
+                if len(reminders) > 0 {
+                    tempUser := types.User{Id: user.Id, Time: reminders}
+                    text = addAllTimeToText(tempUser, text)
                 } else {
                     text = text + " У вас нет установленных уведомлений"
                 }
+    
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
                 msg.ReplyMarkup = showNotificationsMenu()
                 bot.Send(msg)
-                UsersMutex.Unlock()
                 continue
             }
 
             switch update.Message.Text {
             case "Профиль":
-                text := fmt.Sprintf("Профиль:\nИмя: %s\nВозраст: %d\nЧасовой пояс: %s",
-                    Users[i].Name, Users[i].Age, ts.OffsetToEmoji(Users[i].Offset))
-                msg := tgbotapi.NewMessage(update.Message.Chat.ID, text)
-                msg.ReplyMarkup = showMainMenu(Users[i])
-                bot.Send(msg)
-                UsersMutex.Unlock()
-                continue
-            case "Напоминания":
-                if len(Users[i].Time) == 0 {
-                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("У вас нет установленных уведомлений."))
+                freshUser, _, err := database.GetUserByTelegramId(db, tgID)
+                if err != nil {
+                    log.Printf("Ошибка получения пользователя: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Произошла ошибка.")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
+
+                text := fmt.Sprintf("Профиль:\nИмя: %s\nВозраст: %d\nЧасовой пояс: %s",
+                    freshUser.Name, freshUser.Age, ts.OffsetToEmoji(freshUser.Offset))
+                msg := tgbotapi.NewMessage(update.Message.Chat.ID, text)
+                msg.ReplyMarkup = showMainMenu(*freshUser)
+                bot.Send(msg)
+                continue
+
+            case "Напоминания":
+                reminders, err := database.GetRemindersByUserId(db, dbID)
+                if err != nil {
+                    log.Printf("Ошибка получения напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка получения списка.")
+                    bot.Send(msg)
+                    continue
+                }
+    
+                if len(reminders) == 0 {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "У вас нет установленных уведомлений.")
+                    bot.Send(msg)
+                    continue
+                }
+
                 text := fmt.Sprintf(`Установленные уведомления:`)
-                for j, time := range Users[i].Time {
+                for j, time := range reminders {
                     text = fmt.Sprintf("%s\n%d - %d:%d", text, j+1, time.Hour, time.Minute)
                 }
+
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
                 msg.ReplyMarkup = showNotificationsMenu()
                 bot.Send(msg)
-                UsersMutex.Unlock()
                 continue
             case "Отключить уведомления":
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений отключена."))
-                Users[i].State = -1
-                msg.ReplyMarkup = showMainMenu(Users[i])
-                bot.Send(msg)
-                if err = SaveUsers(); err != nil {
-                    fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                    UsersMutex.Unlock()
+                err := database.UpdateUserState(db, user.Id, -1)
+                if err != nil {
+                    log.Printf("Ошибка отключения уведомлений: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка. Попробуйте позже.")
+                    bot.Send(msg)
                     continue
                 }
-                UsersMutex.Unlock()
+
+                updatedUser, _, err := database.GetUserByTelegramId(db, tgID)
+                if err != nil {
+                    log.Printf("Ошибка получения обновленного пользователя: %v", err)
+                }
+
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений отключена."))
+                msg.ReplyMarkup = showMainMenu(*updatedUser)
+                bot.Send(msg)
                 continue
             case "Включить уведомления":
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений снова включена!"))
-                Users[i].State = 0
-                msg.ReplyMarkup = showMainMenu(Users[i])
-                bot.Send(msg)
-                if err = SaveUsers(); err != nil {
-                    fmt.Printf("Ошибка сохранения пользователя: %v", err)
-                    UsersMutex.Unlock()
+                err := database.UpdateUserState(db, user.Id, 0)
+                if err != nil {
+                    log.Printf("Ошибка включения уведомлений: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка. Попробуйте позже.")
+                    bot.Send(msg)
                     continue
                 }
-                UsersMutex.Unlock()
+
+                updatedUser, _, err := database.GetUserByTelegramId(db, tgID)
+                if err != nil {
+                    log.Printf("Ошибка получения обновленного пользователя: %v", err)
+                }
+
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Отправка уведомлений снова включена!"))
+                msg.ReplyMarkup = showMainMenu(*updatedUser)
+                bot.Send(msg)
                 continue
+
             case "Добавить":
-                if len(Users[i].Time) > 10 {
-                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("У тебя уже есть 10 уведомлений."))
+                count, err := database.CountUserReminders(db, dbID)
+                if err != nil {
+                    log.Printf("Ошибка подсчета напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка проверки лимита.")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
+                }
+    
+                if count >= 10 {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "❌ У тебя уже есть 10 уведомлений.")
+                    bot.Send(msg)
+                    continue
+                }
+
+                 err = database.UpdateUserState(db, user.Id, 5)
+                if err != nil {
+                    log.Printf("Ошибка обновления состояния: %v", err)
                 }
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Для добавления нового уведомления, напиши время нового уведомления в формате hh:mm. Для отмены, напиши cancel"))
                 msg.ReplyMarkup = tgbotapi.NewRemoveKeyboard(false)
                 bot.Send(msg)
-                Users[i].State = 5
-                UsersMutex.Unlock()
                 continue
+
             case "Удалить":
-                if len(Users[i].Time) == 0 {
-                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("У тебя уже нет уведомлений."))
+                reminders, err := database.GetRemindersByUserId(db, dbID)
+                if err != nil {
+                    log.Printf("Ошибка получения напоминаний: %v", err)
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "Ошибка получения списка.")
                     bot.Send(msg)
-                    UsersMutex.Unlock()
                     continue
                 }
-                text := fmt.Sprintf(`Для удаления уведомления, напиши номер удаляемого уведомления.`)
+    
+                if len(reminders) == 0 {
+                    msg = tgbotapi.NewMessage(update.Message.Chat.ID, "❌ У тебя уже нет уведомлений.")
+                    bot.Send(msg)
+                    continue
+                }
+                err = database.UpdateUserState(db, user.Id, 6)
+                if err != nil {
+                    log.Printf("Ошибка обновления состояния: %v", err)
+                }
+
+                text := fmt.Sprintf(`Для удаления уведомления, напиши номер удаляемого уведомления, или нажми на кнопку ниже.`)
                 text = text + "\nДля отмены, напиши cancel"
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, text)
-                msg.ReplyMarkup = showDeleteMenu(Users[i])
+                msg.ReplyMarkup = showDeleteMenu(types.User{Id: user.Id, Time: reminders})
                 bot.Send(msg)
-                Users[i].State = 6
-                UsersMutex.Unlock()
                 continue
             case "Назад":
                 msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Главное меню:"))
-                msg.ReplyMarkup = showMainMenu(Users[i])
+                msg.ReplyMarkup = showMainMenu(*user)
                 bot.Send(msg)
-                UsersMutex.Unlock()
                 continue
             default:
-                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, %s! <ТЕКСТ>", Users[i].Name))
-                msg.ReplyMarkup = showMainMenu(Users[i])
+                msg = tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Привет, %s! <ТЕКСТ>", user.Name))
+                msg.ReplyMarkup = showMainMenu(*user)
                 bot.Send(msg)
-                UsersMutex.Unlock()
                 continue
             }
         }

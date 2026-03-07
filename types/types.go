@@ -14,3 +14,8 @@ type User struct{
     Age int `json:"age"`
     State int
 }
+
+type ReminderWithID struct {
+    ID int64
+    Reminder TimeEntry
+}
