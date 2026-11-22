@@ -4,18 +4,21 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
-	"nutribot/types"
 	ts "nutribot/timestamp"
+	"nutribot/types"
+	"strings"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/agnivade/levenshtein"
+
+	_ "modernc.org/sqlite"
 )
 
 func InitDB() (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", "./bot.db")
+	db, err := sql.Open("sqlite", "./bot.db")
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if err = db.Ping(); err != nil {
 		return nil, err
 	}
@@ -50,8 +53,21 @@ func createTables(db *sql.DB) error {
 	);`
 	indexUser := `CREATE INDEX IF NOT EXISTS idx_telegram_id ON users(telegram_id);`
 	indexReminders := `CREATE INDEX IF NOT EXISTS idx_user_id ON reminders(user_id);`
+	nutrientsTable := `
+	CREATE TABLE IF NOT EXISTS nutrients (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL UNIQUE,
+		display_name TEXT NOT NULL,
+		calories REAL NOT NULL,
+		protein REAL NOT NULL,
+		fat REAL NOT NULL,
+		carbs REAL NOT NULL,
+		source TEXT DEFAULT 'manual',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`
+	indexNutrients := `CREATE INDEX IF NOT EXISTS idx_nutrients_name ON nutrients(name);`
 
-	queries := []string{userTable, reminderTable, indexUser, indexReminders}
+	queries := []string{userTable, reminderTable, indexUser, indexReminders, nutrientsTable, indexNutrients}
 
 	for _, query := range queries {
 		_, err := db.Exec(query)
@@ -63,37 +79,37 @@ func createTables(db *sql.DB) error {
 }
 
 func LoadOffsets(db *sql.DB, offsetManager *ts.OffsetManager) error {
-    query := `SELECT telegram_id, "offset" FROM users`
-    
-    rows, err := db.Query(query)
-    if err != nil {
-        return fmt.Errorf("ошибка загрузки offset: %v", err)
-    }
-    defer rows.Close()
-    
-    loadedCount := 0
-    for rows.Next() {
-        var tgid int64
-        var offset int
-        
-        if err := rows.Scan(&tgid, &offset); err != nil {
-            log.Printf("Ошибка сканирования offset: %v", err)
-            continue
-        }
-        
-        if err := offsetManager.SetUserOffset(tgid, offset); err != nil {
-            log.Printf("Ошибка установки offset для пользователя %d: %v", tgid, err)
-        } else {
-            loadedCount++
-        }
-    }
-    
-    if err = rows.Err(); err != nil {
-        return fmt.Errorf("ошибка при итерации по строкам: %v", err)
-    }
-    
-    log.Printf("Загружено %d смещений часовых поясов", loadedCount)
-    return nil
+	query := `SELECT telegram_id, "offset" FROM users`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return fmt.Errorf("ошибка загрузки offset: %v", err)
+	}
+	defer rows.Close()
+
+	loadedCount := 0
+	for rows.Next() {
+		var tgid int64
+		var offset int
+
+		if err := rows.Scan(&tgid, &offset); err != nil {
+			log.Printf("Ошибка сканирования offset: %v", err)
+			continue
+		}
+
+		if err := offsetManager.SetUserOffset(tgid, offset); err != nil {
+			log.Printf("Ошибка установки offset для пользователя %d: %v", tgid, err)
+		} else {
+			loadedCount++
+		}
+	}
+
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("ошибка при итерации по строкам: %v", err)
+	}
+
+	log.Printf("Загружено %d смещений часовых поясов", loadedCount)
+	return nil
 }
 
 func CreateUser(db *sql.DB, tgid int, chatid int, name string, age int, offset int, state int) (int64, error) {
@@ -105,7 +121,7 @@ func CreateUser(db *sql.DB, tgid int, chatid int, name string, age int, offset i
 
 	userID, err := res.LastInsertId()
 	if err != nil {
-    	return 0, err
+		return 0, err
 	}
 
 	return userID, nil
@@ -156,7 +172,7 @@ func GetUserById(db *sql.DB, id int64) (*types.User, error) {
 	return &user, nil
 }
 
-func UpdateUserState(db *sql.DB, tgid int, state int) (error) {
+func UpdateUserState(db *sql.DB, tgid int, state int) error {
 	query := `UPDATE users SET state = ? WHERE telegram_id = ?`
 
 	result, err := db.Exec(query, state, tgid)
@@ -176,7 +192,7 @@ func UpdateUserState(db *sql.DB, tgid int, state int) (error) {
 	return nil
 }
 
-func DeleteUser(db *sql.DB, tgid int) (error) {
+func DeleteUser(db *sql.DB, tgid int) error {
 	query := `DELETE FROM users WHERE telegram_id = ?`
 	result, err := db.Exec(query, tgid)
 	if err != nil {
@@ -195,7 +211,7 @@ func DeleteUser(db *sql.DB, tgid int) (error) {
 	return nil
 }
 
-func UpdateUserProfile(db *sql.DB, tgid int, offset int, name string, age int) (error) {
+func UpdateUserProfile(db *sql.DB, tgid int, offset int, name string, age int) error {
 	query := `UPDATE users SET "offset" = ?, name = ?, age = ? WHERE telegram_id = ?`
 
 	result, err := db.Exec(query, offset, name, age, tgid)
@@ -310,7 +326,7 @@ func DeleteReminderByTimestamp(db *sql.DB, time types.TimeEntry, id int64) error
 }
 
 func DeleteReminderById(db *sql.DB, id int64) error {
-query := `DELETE FROM reminders WHERE id = ?`
+	query := `DELETE FROM reminders WHERE id = ?`
 	result, err := db.Exec(query, id)
 	if err != nil {
 		return fmt.Errorf("ошибка удаления напоминания: %v", err)
@@ -340,7 +356,7 @@ func DeleteAllReminders(db *sql.DB, id int64) error {
 
 func CountUserReminders(db *sql.DB, id int64) (int, error) {
 	query := `SELECT COUNT(*) FROM reminders WHERE user_id = ?`
-	
+
 	var count int
 	err := db.QueryRow(query, id).Scan(&count)
 	if err != nil {
@@ -385,26 +401,26 @@ func UserExists(db *sql.DB, tgid int) bool {
 
 func GetRemindersWithID(db *sql.DB, userID int64) ([]types.ReminderWithID, error) {
 	query := `SELECT id, hour, minute FROM reminders WHERE user_id = ? ORDER BY hour, minute`
-    rows, err := db.Query(query, userID)
-    if err != nil {
-        return nil, err
-    }
-    defer rows.Close()
+	rows, err := db.Query(query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 
-    var reminders []types.ReminderWithID
-    for rows.Next() {
-        var r types.ReminderWithID
-        err := rows.Scan(&r.ID, &r.Reminder.Hour, &r.Reminder.Minute)
-        if err != nil {
-            return nil, err
-        }
-        reminders = append(reminders, r)
-    }
-    return reminders, rows.Err()
+	var reminders []types.ReminderWithID
+	for rows.Next() {
+		var r types.ReminderWithID
+		err := rows.Scan(&r.ID, &r.Reminder.Hour, &r.Reminder.Minute)
+		if err != nil {
+			return nil, err
+		}
+		reminders = append(reminders, r)
+	}
+	return reminders, rows.Err()
 }
 
 func GetAllUsersWithReminders(db *sql.DB) ([]types.User, error) {
-    query := `
+	query := `
         SELECT 
             u.telegram_id, u.chat_id, u.name, u.age, u."offset", u.state,
             r.hour, r.minute
@@ -413,55 +429,138 @@ func GetAllUsersWithReminders(db *sql.DB) ([]types.User, error) {
         ORDER BY u.telegram_id
     `
 
-    rows, err := db.Query(query)
-    if err != nil {
-        return nil, fmt.Errorf("ошибка JOIN запроса: %v", err)
-    }
-    defer rows.Close()
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка JOIN запроса: %v", err)
+	}
+	defer rows.Close()
 
-    usersMap := make(map[int]*types.User)
-    var sortedIDs []int
+	usersMap := make(map[int]*types.User)
+	var sortedIDs []int
 
-    for rows.Next() {
-        var tgid int
-        var chatID int
-        var name string
-        var age int
-        var offset int
-        var state int
-        var hour, minute sql.NullInt64
+	for rows.Next() {
+		var tgid int
+		var chatID int
+		var name string
+		var age int
+		var offset int
+		var state int
+		var hour, minute sql.NullInt64
 
-        err := rows.Scan(&tgid, &chatID, &name, &age, &offset, &state, &hour, &minute)
-        if err != nil {
-            return nil, fmt.Errorf("ошибка сканирования: %v", err)
-        }
+		err := rows.Scan(&tgid, &chatID, &name, &age, &offset, &state, &hour, &minute)
+		if err != nil {
+			return nil, fmt.Errorf("ошибка сканирования: %v", err)
+		}
 
-        if _, ok := usersMap[tgid]; !ok {
-            user := &types.User{
-                Id:     tgid,
-                ChatID: chatID,
-                Name:   name,
-                Age:    age,
-                Offset: offset,
-                State:  state,
-                Time:   []types.TimeEntry{},
-            }
-            usersMap[tgid] = user
-            sortedIDs = append(sortedIDs, tgid)
-        }
+		if _, ok := usersMap[tgid]; !ok {
+			user := &types.User{
+				Id:     tgid,
+				ChatID: chatID,
+				Name:   name,
+				Age:    age,
+				Offset: offset,
+				State:  state,
+				Time:   []types.TimeEntry{},
+			}
+			usersMap[tgid] = user
+			sortedIDs = append(sortedIDs, tgid)
+		}
 
-        if hour.Valid && minute.Valid {
-            usersMap[tgid].Time = append(usersMap[tgid].Time, types.TimeEntry{
-                Hour:   int(hour.Int64),
-                Minute: int(minute.Int64),
-            })
-        }
-    }
+		if hour.Valid && minute.Valid {
+			usersMap[tgid].Time = append(usersMap[tgid].Time, types.TimeEntry{
+				Hour:   int(hour.Int64),
+				Minute: int(minute.Int64),
+			})
+		}
+	}
 
-    var result []types.User
-    for _, id := range sortedIDs {
-        result = append(result, *usersMap[id])
-    }
+	var result []types.User
+	for _, id := range sortedIDs {
+		result = append(result, *usersMap[id])
+	}
 
-    return result, nil
+	return result, nil
+}
+
+func normalizeIngredientName(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+func InsertNutriens(db *sql.DB, name string, n types.Nutrients, source string) error {
+	query := `INSERT INTO nutrients (name, display_name, calories, protein, fat, carbs, source)
+	          VALUES (?, ?, ?, ?, ?, ?, ?)
+	          ON CONFLICT(name) DO NOTHING`
+	_, err := db.Exec(query, normalizeIngredientName(name), name, n.Calories, n.Protein, n.Fat, n.Carbs, source)
+	if err != nil {
+		return fmt.Errorf("ошибка добавления продукта: %v", err)
+	}
+	return nil
+}
+
+type NutrientEntry struct {
+	id   int64
+	name string
+}
+
+func LoadNutrientNames(db *sql.DB) ([]NutrientEntry, error) {
+	rows, err := db.Query(`SELECT id, name FROM nutrients`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []NutrientEntry
+	for rows.Next() {
+		var e NutrientEntry
+		if err := rows.Scan(&e.id, &e.name); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+func GetNutrientByID(db *sql.DB, id int64) (*types.Nutrients, error) {
+	row := db.QueryRow(`SELECT calories, protein, fat, carbs FROM nutrients WHERE id = ?`, id)
+	var n types.Nutrients
+	if err := row.Scan(&n.Calories, &n.Protein, &n.Fat, &n.Carbs); err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
+func FindNutrientFuzzy(db *sql.DB, requestedName string, cache []NutrientEntry) (*types.Nutrients, string, int, error) {
+	target := normalizeIngredientName(requestedName)
+
+	bestScore := 0
+	var bestID int64 = -1
+	var bestName string
+
+	for _, e := range cache {
+		dist := levenshtein.ComputeDistance(target, e.name)
+		maxLen := len(target)
+		if len(e.name) > maxLen {
+			maxLen = len(e.name)
+		}
+		if maxLen == 0 {
+			continue
+		}
+		similarity := 100 - (dist*100)/maxLen
+		if similarity > bestScore {
+			bestScore = similarity
+			bestID = e.id
+			bestName = e.name
+		}
+	}
+
+	const threshold = 70
+	if bestScore < threshold || bestID == -1 {
+		return nil, "", 0, nil
+	}
+
+	n, err := GetNutrientByID(db, bestID)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	return n, bestName, bestScore, nil
 }
