@@ -3,10 +3,10 @@ package reminder
 import (
 	"database/sql"
 	"fmt"
+	"nutribot/database"
 	ts "nutribot/timestamp"
 	"nutribot/types"
 	"time"
-	"nutribot/database"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -49,29 +49,29 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) checkReminders() {
-    currentUTC := time.Now().UTC()
-    
-    users, err := database.GetAllUsersWithReminders(s.db)
-    if err != nil {
-        fmt.Printf("Ошибка получения пользователей из БД: %v\n", err)
-        return
-    }
-    
-    for _, user := range users {
-        if user.State < 0 {
-            continue
-        }
-        
-        userTime, err := s.getUserTime(user.Id, currentUTC)
-        if err != nil {
-            fmt.Printf("Ошибка получения времени для пользователя %d: %v\n", user.Id, err)
-            continue
-        }
-        
-        if s.shouldRemind(user, userTime) {
-            s.sendRemind(user)
-        }
-    }
+	currentUTC := time.Now().UTC()
+
+	users, err := database.GetAllUsersWithReminders(s.db)
+	if err != nil {
+		fmt.Printf("Ошибка получения пользователей из БД: %v\n", err)
+		return
+	}
+
+	for _, user := range users {
+		if user.State < 0 {
+			continue
+		}
+
+		userTime, err := s.getUserTime(user.Id, currentUTC)
+		if err != nil {
+			fmt.Printf("Ошибка получения времени для пользователя %d: %v\n", user.Id, err)
+			continue
+		}
+
+		if s.shouldRemind(user, userTime) {
+			s.sendRemind(user)
+		}
+	}
 }
 
 func (s *Scheduler) getUserTime(id int, current time.Time) (time.Time, error) {
@@ -87,7 +87,7 @@ func (s *Scheduler) getUserTime(id int, current time.Time) (time.Time, error) {
 func (s *Scheduler) shouldRemind(user types.User, uTime time.Time) bool {
 	currentHour := uTime.Hour()
 	currentMinute := uTime.Minute()
-	
+
 	for _, reminder := range user.Time {
 		if reminder.Hour == currentHour && reminder.Minute == currentMinute {
 			return true
@@ -96,8 +96,15 @@ func (s *Scheduler) shouldRemind(user types.User, uTime time.Time) bool {
 	return false
 }
 
+func showSchedMenu() tgbotapi.InlineKeyboardMarkup {
+	keyboard := tgbotapi.NewInlineKeyboardMarkup()
+	keyboard.InlineKeyboard = append(keyboard.InlineKeyboard, []tgbotapi.InlineKeyboardButton{tgbotapi.NewInlineKeyboardButtonData("Я поел", "ready")})
+	return keyboard
+}
+
 func (s *Scheduler) sendRemind(user types.User) {
 	msg := tgbotapi.NewMessage(int64(user.ChatID), fmt.Sprintf("%s, время принять пищу!", user.Name))
+	msg.ReplyMarkup = showSchedMenu()
 	_, err := s.bot.Send(msg)
 
 	if err != nil {
